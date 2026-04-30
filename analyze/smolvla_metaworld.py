@@ -4,11 +4,8 @@ SmolVLA zero-shot eval on MetaWorld.
 Run from repo root (WSL2, conda env lerobot):
     python analyze/smolvla_metaworld.py
 
-What this does:
-- Loads smolvla_base from HuggingFace Hub
-- Runs it zero-shot against assembly-v3 (pick nut → peg)
-- Prints per-step reward and success flag
-- Expects near-zero success — this establishes the zero-shot baseline
+Videos are saved to outputs/eval/smolvla_metaworld/ and can be opened directly
+on Windows (WSL2 writes to the Windows filesystem).
 
 Inputs SmolVLA expects (built manually here, no pipeline):
   observation.images.<key>    float32 tensor (1, C, H, W) in [0, 1]
@@ -20,6 +17,9 @@ Inputs SmolVLA expects (built manually here, no pipeline):
 import sys
 sys.path.insert(0, "src")
 
+from pathlib import Path
+
+import imageio
 import numpy as np
 import torch
 from transformers import AutoTokenizer
@@ -31,6 +31,7 @@ TASK = "assembly-v3"
 N_EPISODES = 3
 MAX_STEPS = 200
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+VIDEO_DIR = Path("outputs/eval/smolvla_metaworld")
 
 
 def make_batch(obs, lang_tokens, lang_mask, image_key, device):
@@ -51,9 +52,12 @@ def make_batch(obs, lang_tokens, lang_mask, image_key, device):
 
 
 def main():
+    VIDEO_DIR.mkdir(parents=True, exist_ok=True)
+
     print(f"Device: {DEVICE}")
     print(f"Task: {TASK}")
-    print(f"Task description: {TASK_DESCRIPTIONS[TASK]!r}\n")
+    print(f"Task description: {TASK_DESCRIPTIONS[TASK]!r}")
+    print(f"Videos will be saved to: {VIDEO_DIR.resolve()}\n")
 
     # Load policy
     print("Loading smolvla_base ...")
@@ -65,16 +69,13 @@ def main():
     image_keys = list(policy.config.image_features.keys())
     print(f"Policy image_features keys: {image_keys}")
     if len(image_keys) != 1:
-        print(
-            "WARNING: expected exactly 1 image key, got "
-            f"{len(image_keys)}. Using the first one."
-        )
+        print(f"WARNING: expected 1 image key, got {len(image_keys)}. Using the first one.")
     image_key = image_keys[0]
     print(f"Using image key: {image_key!r}\n")
 
-    # Tokenize the task description once (reused across all steps)
+    # Tokenize the task description once — reused every step
     tokenizer = AutoTokenizer.from_pretrained(policy.config.vlm_model_name)
-    task_text = TASK_DESCRIPTIONS[TASK] + "\n"      # NewLineTaskProcessorStep adds \n
+    task_text = TASK_DESCRIPTIONS[TASK] + "\n"      # NewLineTaskProcessorStep appends \n
     tokenized = tokenizer(
         [task_text],
         max_length=policy.config.tokenizer_max_length,
@@ -83,11 +84,10 @@ def main():
         padding_side="right",
         return_tensors="pt",
     )
-    lang_tokens = tokenized["input_ids"]                         # (1, seq_len)
-    lang_mask = tokenized["attention_mask"].bool()               # (1, seq_len)
+    lang_tokens = tokenized["input_ids"]            # (1, seq_len)
+    lang_mask = tokenized["attention_mask"].bool()  # (1, seq_len)
     print(f"Language token shape: {lang_tokens.shape}\n")
 
-    # Eval loop
     env = MetaworldEnv(task=TASK, obs_type="pixels_agent_pos")
 
     episode_successes = []
@@ -97,17 +97,19 @@ def main():
 
         ep_success = False
         total_reward = 0.0
+        frames = [obs["pixels"]]  # capture the initial frame
 
         for step in range(MAX_STEPS):
             batch = make_batch(obs, lang_tokens, lang_mask, image_key, DEVICE)
 
             with torch.inference_mode():
-                action = policy.select_action(batch)            # (1, action_dim)
+                action = policy.select_action(batch)        # (1, action_dim)
 
-            # Policy is SO-100 trained (6D), MetaWorld needs 4D — take the first 4 dims.
+            # Policy outputs 6D (SO-100 arm); MetaWorld expects 4D — truncate.
             action_np = action.squeeze(0).cpu().numpy().astype(np.float64)[:4]
             obs, reward, terminated, truncated, info = env.step(action_np)
 
+            frames.append(obs["pixels"])
             total_reward += reward
             if info.get("is_success"):
                 ep_success = True
@@ -120,13 +122,19 @@ def main():
             if terminated or truncated:
                 break
 
+        # Save episode video
+        video_path = VIDEO_DIR / f"ep{ep:02d}_{'success' if ep_success else 'fail'}.mp4"
+        imageio.mimsave(str(video_path), frames, fps=20)
+        print(f"\nSaved video → {video_path}")
+
         episode_successes.append(ep_success)
-        print(f"\n--- Episode {ep} done | success={ep_success} ---\n")
+        print(f"--- Episode {ep} done | success={ep_success} ---\n")
 
     env.close()
 
     success_rate = sum(episode_successes) / len(episode_successes)
     print(f"Zero-shot success rate: {success_rate:.0%} ({sum(episode_successes)}/{len(episode_successes)})")
+    print(f"\nAll videos in: {VIDEO_DIR.resolve()}")
 
 
 if __name__ == "__main__":
