@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mkdir -p /mnt/c/Users/philc/code/lerobot/analyze)",
+      "Read(//mnt/c/Users/philc/code/lerobot/**)"
+    ]
+  }
+}
